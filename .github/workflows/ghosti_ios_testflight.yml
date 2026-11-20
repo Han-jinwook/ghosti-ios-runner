@@ -12,8 +12,12 @@ on:
         required: false
         default: "16"
 
+permissions:
+  contents: read
+
 jobs:
   build-and-upload-ios:
+    if: github.actor == 'Han-jinwook'
     runs-on: macos-26
     timeout-minutes: 30
     steps:
@@ -35,6 +39,7 @@ jobs:
           ref: main
           path: ghosti
           token: ${{ secrets.GH_PAT }}
+          persist-credentials: false
 
       - name: Setup Node.js 22
         uses: actions/setup-node@v4
@@ -163,3 +168,9 @@ jobs:
             -f "$IPA_FILE" \
             --apiKey "$APPLE_API_KEY_ID" \
             --apiIssuer "$APPLE_API_ISSUER_ID"
+
+      - name: Shred Temporary Signing Credentials
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" || true
+          rm -rf "$RUNNER_TEMP/build_certificate.p12" "$RUNNER_TEMP/build_pp.mobileprovision" ~/.appstoreconnect/private_keys || true
