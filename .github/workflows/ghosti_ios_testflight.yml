@@ -1,0 +1,165 @@
+name: Ghosti iOS TestFlight Build & Upload
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: "Marketing Version (e.g. 1.0.16)"
+        required: false
+        default: "1.0.16"
+      build_number:
+        description: "Build Number (e.g. 16)"
+        required: false
+        default: "16"
+
+jobs:
+  build-and-upload-ios:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - name: Select Latest Xcode (26+)
+        run: |
+          ls -d /Applications/Xcode*.app
+          LATEST_XCODE=$(ls -d /Applications/Xcode*.app | grep -v -i beta | sort -V | tail -n 1)
+          if [ -z "$LATEST_XCODE" ]; then
+            LATEST_XCODE=$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)
+          fi
+          echo "Selecting Xcode: $LATEST_XCODE"
+          sudo xcode-select -s "$LATEST_XCODE/Contents/Developer"
+          xcodebuild -version
+
+      - name: Checkout Ghosti Repository
+        uses: actions/checkout@v4
+        with:
+          repository: Han-jinwook/Ghosti
+          ref: main
+          path: ghosti
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Web Dependencies & Build Web Bundle
+        working-directory: ghosti
+        run: |
+          rm -rf public/Merlin_Z_Core.zip public/showroom public/poc public/*_4K.jpg || true
+          npm install --legacy-peer-deps
+          npm run build
+          rm -rf dist/Merlin_Z_Core.zip dist/showroom dist/poc dist/*_4K.jpg || true
+          npx cap sync ios
+          rm -rf ios/App/App/public/Merlin_Z_Core.zip ios/App/App/public/showroom ios/App/App/public/poc ios/App/App/public/*_4K.jpg || true
+
+      - name: Configure iOS Info.plist & Project Signing
+        working-directory: ghosti
+        env:
+          VERSION_NAME: ${{ inputs.version_name || '1.0.16' }}
+          BUILD_NUMBER: ${{ inputs.build_number || '16' }}
+          TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+        run: |
+          plutil -replace ITSAppUsesNonExemptEncryption -bool NO ios/App/App/Info.plist
+          python3 - << 'EOF'
+          import os
+          pbx_path = "ios/App/App.xcodeproj/project.pbxproj"
+          with open(pbx_path, "r", encoding="utf-8") as f:
+              txt = f.read()
+          ver = os.environ.get("VERSION_NAME", "1.0.16")
+          bld = os.environ.get("BUILD_NUMBER", "16")
+          team = os.environ.get("TEAM_ID", "7K5PPQDZ5L")
+          txt = txt.replace("ProvisioningStyle = Automatic;", f"ProvisioningStyle = Manual;\n\t\t\t\t\t\tDevelopmentTeam = {team};")
+          txt = txt.replace(
+              "CODE_SIGN_STYLE = Automatic;",
+              f'CODE_SIGN_STYLE = Manual;\n\t\t\t\tDEVELOPMENT_TEAM = {team};\n\t\t\t\tCODE_SIGN_IDENTITY = "Apple Distribution";\n\t\t\t\tPROVISIONING_PROFILE_SPECIFIER = "Ghosti App Store";'
+          )
+          txt = txt.replace("CURRENT_PROJECT_VERSION = 1;", f"CURRENT_PROJECT_VERSION = {bld};")
+          txt = txt.replace("MARKETING_VERSION = 1.0;", f"MARKETING_VERSION = {ver};")
+          with open(pbx_path, "w", encoding="utf-8") as f:
+              f.write(txt)
+          print("Updated project.pbxproj for manual App Store signing:", ver, bld)
+          EOF
+
+      - name: Install Apple Distribution Certificate & Provisioning Profile
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.IOS_BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
+          BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_MOBILEPROVISION_BASE64 }}
+          KEYCHAIN_PASSWORD: "TempKeychainPassword2026!"
+        run: |
+          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+          PP_PATH=$RUNNER_TEMP/build_pp.mobileprovision
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o $CERTIFICATE_PATH
+          echo -n "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode -o $PP_PATH
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          security import $CERTIFICATE_PATH -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH $(security list-keychains -d user | sed s/\"//g)
+
+          UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< $(/usr/bin/security cms -D -i $PP_PATH))
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp $PP_PATH "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
+          echo "Installed Provisioning Profile UUID: $UUID"
+
+      - name: Archive & Export Signed IPA
+        working-directory: ghosti
+        env:
+          TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+        run: |
+          cat << EOF > $RUNNER_TEMP/ExportOptions.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key>
+              <string>app-store-connect</string>
+              <key>teamID</key>
+              <string>${TEAM_ID}</string>
+              <key>signingStyle</key>
+              <string>manual</string>
+              <key>uploadSymbols</key>
+              <true/>
+              <key>provisioningProfiles</key>
+              <dict>
+                  <key>app.sundreamer.ghosti</key>
+                  <string>Ghosti App Store</string>
+              </dict>
+          </dict>
+          </plist>
+          EOF
+
+          xcodebuild -project ios/App/App.xcodeproj \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath $RUNNER_TEMP/Ghosti.xcarchive \
+            archive
+
+          xcodebuild -exportArchive \
+            -archivePath $RUNNER_TEMP/Ghosti.xcarchive \
+            -exportOptionsPlist $RUNNER_TEMP/ExportOptions.plist \
+            -exportPath $RUNNER_TEMP/export
+
+          ls -lh $RUNNER_TEMP/export
+
+      - name: Upload IPA to App Store Connect (TestFlight)
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo "$APPLE_API_PRIVATE_KEY" > ~/.appstoreconnect/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8
+          IPA_FILE=$(ls $RUNNER_TEMP/export/*.ipa | head -n 1)
+          echo "Uploading $IPA_FILE to TestFlight..."
+          xcrun altool --upload-app \
+            --type ios \
+            -f "$IPA_FILE" \
+            --apiKey "$APPLE_API_KEY_ID" \
+            --apiIssuer "$APPLE_API_ISSUER_ID"
