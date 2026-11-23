@@ -1,0 +1,164 @@
+name: Ghosti Android Play Internal Build & Upload
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: "Version Name (e.g. 1.0.67)"
+        required: true
+      build_number:
+        description: "Version Code (e.g. 67)"
+        required: true
+      release_notes:
+        description: "Release notes (ko-KR)"
+        required: false
+        default: "귀신같이 내부 테스트 업데이트"
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-upload-android:
+    if: github.actor == 'Han-jinwook'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Ghosti Repository
+        uses: actions/checkout@v4
+        with:
+          repository: Han-jinwook/Ghosti
+          ref: main
+          path: ghosti
+          token: ${{ secrets.GH_PAT }}
+          persist-credentials: false
+
+      - name: Setup Node.js 22 & Java 21
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Build Web Bundle & Sync Capacitor Android
+        working-directory: ghosti
+        run: |
+          rm -rf public/Merlin_Z_Core.zip public/showroom public/poc public/*_4K.jpg || true
+          npm install --legacy-peer-deps
+          npm run build
+          rm -rf dist/Merlin_Z_Core.zip dist/showroom dist/poc dist/*_4K.jpg || true
+          npx cap sync android
+          rm -rf android/app/src/main/assets/public/Merlin_Z_Core.zip android/app/src/main/assets/public/showroom android/app/src/main/assets/public/poc android/app/src/main/assets/public/*_4K.jpg || true
+
+      - name: Configure Version & Signing Keystore
+        working-directory: ghosti
+        env:
+          VERSION_NAME: ${{ inputs.version_name }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PW: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PW: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          python3 - << 'EOF'
+          import os, re
+          p = "android/app/build.gradle"
+          with open(p, "r", encoding="utf-8") as f:
+              txt = f.read()
+          txt = re.sub(r"versionCode\s+\d+", f"versionCode {os.environ['BUILD_NUMBER']}", txt, count=1)
+          txt = re.sub(r'versionName\s+"[^"]+"', f'versionName "{os.environ["VERSION_NAME"]}"', txt, count=1)
+          with open(p, "w", encoding="utf-8") as f:
+              f.write(txt)
+          print("Updated build.gradle:", os.environ["VERSION_NAME"], os.environ["BUILD_NUMBER"])
+          EOF
+          echo -n "$KEYSTORE_B64" | base64 --decode > "${{ runner.temp }}/upload.jks"
+          cat << EOF > android/keystore.properties
+          storeFile=${{ runner.temp }}/upload.jks
+          storePassword=${KEYSTORE_PW}
+          keyAlias=${KEY_ALIAS}
+          keyPassword=${KEY_PW}
+          EOF
+
+      - name: Build Release AAB
+        working-directory: ghosti/android
+        run: |
+          chmod +x gradlew
+          ./gradlew bundleRelease --no-daemon
+
+      - name: Upload AAB to Google Play Internal Track
+        working-directory: ghosti
+        env:
+          GOOGLE_PLAY_SA_JSON: ${{ secrets.GOOGLE_PLAY_SA_JSON }}
+          VERSION_NAME: ${{ inputs.version_name }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          python3 -m pip install --quiet requests PyJWT cryptography
+          python3 - << 'EOF'
+          import json, os, time, jwt, requests
+
+          sa = json.loads(os.environ["GOOGLE_PLAY_SA_JSON"])
+          pkg = "app.sundreamer.ghosti"
+          aab_path = "android/app/build/outputs/bundle/release/app-release.aab"
+          ver = os.environ["VERSION_NAME"]
+          bld = os.environ["BUILD_NUMBER"]
+          notes = os.environ.get("RELEASE_NOTES") or f"귀신같이 v{ver} (빌드 {bld}) 내부 테스트 업데이트"
+
+          now = int(time.time())
+          hdrs = {"kid": sa["private_key_id"]} if sa.get("private_key_id") else None
+          assertion = jwt.encode(
+              {
+                  "iss": sa["client_email"],
+                  "scope": "https://www.googleapis.com/auth/androidpublisher",
+                  "aud": sa.get("token_uri", "https://oauth2.googleapis.com/token"),
+                  "iat": now - 30,
+                  "exp": now + 3600,
+              },
+              sa["private_key"],
+              algorithm="RS256",
+              headers=hdrs,
+          )
+          tok = requests.post(
+              sa.get("token_uri", "https://oauth2.googleapis.com/token"),
+              data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": assertion},
+              timeout=15,
+          ).json()["access_token"]
+
+          hj = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
+          base_url = f"https://androidpublisher.googleapis.com/androidpublisher/v3/applications/{pkg}/edits"
+          edit_id = requests.post(base_url, headers=hj, json={}, timeout=20).json()["id"]
+
+          with open(aab_path, "rb") as f:
+              aab_bytes = f.read()
+          up_url = f"https://androidpublisher.googleapis.com/upload/androidpublisher/v3/applications/{pkg}/edits/{edit_id}/bundles?uploadType=media"
+          r_up = requests.post(up_url, headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/octet-stream"}, data=aab_bytes, timeout=300)
+          r_up.raise_for_status()
+          vc = str(r_up.json().get("versionCode", bld))
+
+          rel_title = f"{vc} ({ver})"
+          r_tr = requests.put(
+              f"{base_url}/{edit_id}/tracks/internal",
+              headers=hj,
+              json={
+                  "track": "internal",
+                  "releases": [{
+                      "name": rel_title,
+                      "versionCodes": [vc],
+                      "status": "completed",
+                      "releaseNotes": [{"language": "ko-KR", "text": notes[:500]}],
+                  }],
+              },
+              timeout=20,
+          )
+          r_tr.raise_for_status()
+          r_cm = requests.post(f"{base_url}/{edit_id}:commit", headers=hj, timeout=30)
+          r_cm.raise_for_status()
+          print(f"✅ Google Play internal track released: {rel_title}")
+          EOF
+
+      - name: Shred Signing Credentials
+        if: always()
+        run: |
+          rm -f "${{ runner.temp }}/upload.jks" ghosti/android/keystore.properties || true
