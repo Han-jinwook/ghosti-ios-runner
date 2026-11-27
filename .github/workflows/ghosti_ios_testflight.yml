@@ -79,8 +79,8 @@ jobs:
 
           def patch_cfg(match):
               blk = match.group(0)
-              if "PRODUCT_BUNDLE_IDENTIFIER = app.sundreamer.ghosti.keyboard;" in blk:
-                  spec = "Ghosti Keyboard App Store"
+              if "PRODUCT_BUNDLE_IDENTIFIER = app.sundreamer.ghosti.share;" in blk:
+                  spec = "Ghosti Share App Store"
               elif "PRODUCT_BUNDLE_IDENTIFIER = app.sundreamer.ghosti;" in blk:
                   spec = "Ghosti App Store"
               else:
@@ -96,7 +96,7 @@ jobs:
           txt = txt.replace("MARKETING_VERSION = 1.0;", f"MARKETING_VERSION = {ver};")
           with open(pbx_path, "w", encoding="utf-8") as f:
               f.write(txt)
-          print("Updated project.pbxproj for App + GhostKeyKeyboardExtension manual signing:", ver, bld)
+          print("Updated project.pbxproj for App + GhostKeyShareExtension manual signing:", ver, bld)
           EOF
 
       - name: Install Apple Distribution Certificate & Provisioning Profiles
@@ -173,7 +173,7 @@ jobs:
               profs = json.loads(resp.read().decode("utf-8")).get("data", [])
           kb_prof = next(
               p for p in profs
-              if p["attributes"]["name"] == "Ghosti Keyboard App Store" and p["attributes"]["profileState"] == "ACTIVE"
+              if p["attributes"]["name"] == "Ghosti Share App Store" and p["attributes"]["profileState"] == "ACTIVE"
           )
           raw_pp = base64.b64decode(kb_prof["attributes"]["profileContent"])
           kb_uuid = kb_prof["attributes"]["uuid"]
@@ -205,8 +205,8 @@ jobs:
               <dict>
                   <key>app.sundreamer.ghosti</key>
                   <string>Ghosti App Store</string>
-                  <key>app.sundreamer.ghosti.keyboard</key>
-                  <string>Ghosti Keyboard App Store</string>
+                  <key>app.sundreamer.ghosti.share</key>
+                  <string>Ghosti Share App Store</string>
               </dict>
           </dict>
           </plist>
